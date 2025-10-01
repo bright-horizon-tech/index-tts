@@ -445,6 +445,93 @@ def create_advanced_settings_components_multi():
         advanced_params_multi
     )
 
+# Function to generate audio for text chunks
+def generate_text_chunks(prompt, text_chunks, 
+                         # Emotion control parameters
+                         emo_control_method, emo_ref_path, emo_weight,
+                         vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                         emo_text, emo_random,
+                         # Advanced parameters
+                         do_sample, top_p, top_k, temperature,
+                         length_penalty, num_beams, repetition_penalty, max_mel_tokens,
+                         max_text_tokens_per_segment,
+                         progress=gr.Progress()):
+    try:
+        # Filter out empty chunks
+        valid_chunks = [(i, text) for i, text in enumerate(text_chunks) if text and text.strip()]
+        
+        if not valid_chunks:
+            raise ValueError("No valid text chunks found. Please enter some text.")
+        
+        # Create temporary directory for generated files
+        temp_dir = tempfile.mkdtemp()
+        generated_files = []
+        
+        # Prepare emotion parameters
+        kwargs = {
+            "do_sample": bool(do_sample),
+            "top_p": float(top_p),
+            "top_k": int(top_k) if int(top_k) > 0 else None,
+            "temperature": float(temperature),
+            "length_penalty": float(length_penalty),
+            "num_beams": num_beams,
+            "repetition_penalty": float(repetition_penalty),
+            "max_mel_tokens": int(max_mel_tokens),
+        }
+        
+        if type(emo_control_method) is not int:
+            emo_control_method = emo_control_method.value
+        if emo_control_method == 0:  # emotion from speaker
+            emo_ref_path = None  # remove external reference audio
+        if emo_control_method == 1:  # emotion from reference audio
+            pass
+        if emo_control_method == 2:  # emotion from custom vectors
+            vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+            vec = tts.normalize_emo_vec(vec, apply_bias=True)
+        else:
+            # don't use the emotion vector inputs for the other modes
+            vec = None
+
+        if emo_text == "":
+            # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
+            emo_text = None
+        
+        # Generate audio for each chunk
+        total_chunks = len(valid_chunks)
+        for idx, (original_idx, text) in enumerate(valid_chunks):
+            progress(idx / total_chunks, desc=f"Generating chunk {idx+1}/{total_chunks}")
+            
+            output_path = os.path.join(temp_dir, f"chunk_{original_idx+1}.wav")
+            
+            # Generate audio using the provided parameters
+            tts.infer(
+                spk_audio_prompt=prompt,
+                text=text,
+                output_path=output_path,
+                emo_audio_prompt=emo_ref_path, 
+                emo_alpha=emo_weight,
+                emo_vector=vec,
+                use_emo_text=(emo_control_method==3), 
+                emo_text=emo_text,
+                use_random=emo_random,
+                verbose=cmd_args.verbose,
+                max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+                **kwargs
+            )
+            generated_files.append(output_path)
+        
+        # Create zip file
+        zip_path = os.path.join(temp_dir, "text_chunks_audios.zip")
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            for file in generated_files:
+                zipf.write(file, os.path.basename(file))
+        
+        return zip_path
+    except Exception as e:
+        print(f"Error in generate_text_chunks: {e}")
+        traceback.print_exc()
+        return None
+
 with gr.Blocks(title="IndexTTS Demo") as demo:
     mutex = threading.Lock()
     gr.HTML('''
@@ -464,9 +551,31 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             if prompt_list:
                 default = prompt_list[0]
             with gr.Column():
-                input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
-                gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
-            output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
+                # Text chunks container
+                with gr.Column():
+                    gr.Markdown("### Text Chunks")
+                    gr.Markdown("Enter your text in chunks below. Each chunk will be processed individually and numbered sequentially.")
+                    
+                    # Initial text chunk
+                    text_chunk_1 = gr.TextArea(label="Chunk 1", placeholder="Enter first chunk of text here...", lines=4)
+                    
+                    # Container for additional chunks
+                    with gr.Column() as additional_chunks_container:
+                        pass
+                    
+                    # Buttons to add/remove chunks
+                    with gr.Row():
+                        add_chunk_btn = gr.Button("Add Text Chunk")
+                        remove_chunk_btn = gr.Button("Remove Last Chunk", interactive=False)
+                    
+                    # Hidden state to track number of chunks
+                    num_chunks = gr.State(value=1)
+                    
+                    # Generation button
+                    gen_button = gr.Button(i18n("生成语音"), key="gen_button", interactive=True, variant="primary")
+                
+                # Output for zip file
+                output_zip = gr.File(label="Download Generated Audio (Zip)", visible=False)
 
         experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
 
@@ -565,7 +674,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             # such as `emo_control_method_all` (to be able to see EXPERIMENTAL text labels)!
             components=[prompt_audio,
                         emo_control_method_all,  # important: support all mode labels!
-                        input_text_single,
+                        text_chunk_1,  # Use the first text chunk for examples
                         emo_upload,
                         emo_weight,
                         emo_text,
@@ -577,7 +686,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         return (
             gr.update(value=example[0]),
             gr.update(value=example[1]),
-            gr.update(value=example[2]),
+            gr.update(value=example[2]),  # Set the first text chunk
             gr.update(value=example[3]),
             gr.update(value=example[4]),
             gr.update(value=example[5]),
@@ -596,7 +705,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         inputs=[example_table],
                         outputs=[prompt_audio,
                                  emo_control_method,
-                                 input_text_single,
+                                 text_chunk_1,
                                  emo_upload,
                                  emo_weight,
                                  emo_text,
@@ -679,30 +788,66 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[emo_control_method, example_table]
     )
 
-    input_text_single.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment],
-        outputs=[segments_preview]
+    # Function to add a new text chunk
+    def add_text_chunk(num_chunks):
+        new_num = num_chunks + 1
+        if new_num > 20:  # Limit to 20 chunks
+            new_num = 20
+        
+        # Create a new text area
+        new_text_area = gr.TextArea(label=f"Chunk {new_num}", placeholder=f"Enter chunk {new_num} of text here...", lines=4)
+        
+        # Update the remove button to be interactive if we have more than 1 chunk
+        remove_btn_update = gr.update(interactive=(new_num > 1))
+        
+        return new_num, new_text_area, remove_btn_update
+
+    # Function to remove the last text chunk
+    def remove_text_chunk(num_chunks):
+        new_num = max(1, num_chunks - 1)
+        
+        # Update the remove button to be interactive if we have more than 1 chunk
+        remove_btn_update = gr.update(interactive=(new_num > 1))
+        
+        return new_num, remove_btn_update
+
+    # Connect add chunk button
+    add_chunk_btn.click(
+        add_text_chunk,
+        inputs=num_chunks,
+        outputs=[num_chunks, additional_chunks_container, remove_chunk_btn]
     )
 
-    max_text_tokens_per_segment.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment],
-        outputs=[segments_preview]
+    # Connect remove chunk button
+    remove_chunk_btn.click(
+        remove_text_chunk,
+        inputs=num_chunks,
+        outputs=[num_chunks, remove_chunk_btn]
     )
 
-    prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+    # Function to collect all text chunks
+    def collect_text_chunks(num_chunks, text_chunk_1, *additional_chunks):
+        chunks = [text_chunk_1]
+        chunks.extend(additional_chunks[:num_chunks-1])  # Only take the actual number of chunks
+        return chunks
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             *advanced_params,
-                     ],
-                     outputs=[output_audio])
+    # Connect generation button
+    gen_button.click(
+        generate_text_chunks,
+        inputs=[
+            prompt_audio,
+            num_chunks, text_chunk_1, additional_chunks_container,
+            # Emotion control parameters
+            emo_control_method, emo_upload, emo_weight,
+            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+            emo_text, emo_random,
+            # Advanced parameters
+            do_sample, top_p, top_k, temperature,
+            length_penalty, num_beams, repetition_penalty, max_mel_tokens,
+            max_text_tokens_per_segment
+        ],
+        outputs=[output_zip]
+    )
 
     # Multi-Speaker Mode Tab
     with gr.Tab("Multi Speaker Mode"):
